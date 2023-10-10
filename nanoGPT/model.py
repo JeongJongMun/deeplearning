@@ -124,8 +124,8 @@ class GPT(nn.Module):
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            wte = nn.Embedding(config.vocab_size, config.n_embd), # word token embeddings
+            wpe = nn.Embedding(config.block_size, config.n_embd), #  positional embedding
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
@@ -316,6 +316,7 @@ class GPT(nn.Module):
             logits, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
+            print(logits)
             # optionally crop the logits to only the top k options
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
