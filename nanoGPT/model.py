@@ -33,11 +33,13 @@ class CausalSelfAttention(nn.Module):
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        # c_attn 의 이름은 causal attention을 의미함
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
+
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
@@ -53,7 +55,14 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        # c_attn Layer에 들어가는 input은 (B, T, C)이고, output은 (B, T, 3C)
+        # 3C를 3개로 나눠서 q, k, v로 넣고, 각각의 차원은 (B, T, C)가 됨
+        # q, k, v = (batch_size, block_size, n_embd)
+        # Linear
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        # q, k, v = (batch_size, n_head, block_size, n_embd // n_head)
+        # why? -> scaled_dot_product_attention에서 q, k, v의 차원이 (batch_size, n_head, block_size, n_embd // n_head)이기 때문
+        # (batch_size, block_size, n_embd) -> (batch_size, block_size, n_head, n_embd // n_head) -> (batch_size, n_head, block_size, n_embd // n_head)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -64,15 +73,22 @@ class CausalSelfAttention(nn.Module):
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
             # manual implementation of attention
+            # 3차원 이상 행렬의 곱은 마지막 두 차원 간의 곱이 가능하고, 나머지 앞의 차원은 모두 동일해야 함
+            # ex) (4,8,10,2,3) @ (4,8,10,3,5) -> (4,8,10,2,5)
+            # MatMul & Scaling
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            # Softmax
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+            # MatMul
+            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (batch, head, block, embd // head)
+        # Concat
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
-        y = self.resid_dropout(self.c_proj(y))
+        # Linear
+        y = self.resid_dropout(self.c_proj(y)) 
         return y
 
 class MLP(nn.Module):
@@ -127,10 +143,13 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd), # word token embeddings
             wpe = nn.Embedding(config.block_size, config.n_embd), #  positional embedding
             drop = nn.Dropout(config.dropout),
+            # Encoder
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
+        # using transposed embedding weight
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # lm means language modeling, so lm_head is the final layer for language modeling
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
@@ -142,7 +161,7 @@ class GPT(nn.Module):
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer)) # 이 방법은 초기화 방법 중 하나인 Xavier Initialization
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
@@ -169,22 +188,25 @@ class GPT(nn.Module):
 
     def forward(self, idx, targets=None):
         device = idx.device
-        b, t = idx.size()
+        b, t = idx.size() # B: batch size, T: sequence length
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, block, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
-
+        # Training
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            # logits.view(-1, logits.size(-1)) -> (batch_size * block_size, vocab_size)
+            # target.view(-1) -> (batch_size * block_size)
+        # Generate
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
@@ -305,21 +327,27 @@ class GPT(nn.Module):
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        Take a conditioning sequence of indices idx (LongTensor of  shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
+            # idx_cond means idx_condition
+            # idx_cond = (batch size, sequence length)
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            # logits = (batch size, sequence length, vocab size)
+            logits, _ = self(idx_cond)   # logits = (batch size, -1 ,vocab size)
+
             # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
-            print(logits)
+            logits = logits[:, -1, :] / temperature # batch * vocab
             # optionally crop the logits to only the top k options
             if top_k is not None:
+                # logits.size(-1): vocab size
+                # top_k returns values and indexs: size=(batch size, top k)
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                # top_k 개 중 가장 작은 값보다 작은 값들은 -inf로 만들어줌
                 logits[logits < v[:, [-1]]] = -float('Inf')
             # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)

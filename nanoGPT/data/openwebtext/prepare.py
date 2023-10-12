@@ -36,6 +36,7 @@ if __name__ == '__main__':
     #         num_rows: 4007
     #     })
     # })
+    
 
     # we now want to tokenize the dataset. first define the encoding function (gpt2 bpe)
     enc = tiktoken.get_encoding("gpt2")

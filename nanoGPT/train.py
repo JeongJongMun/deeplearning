@@ -82,10 +82,10 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
 if ddp:
     init_process_group(backend=backend)
-    ddp_rank = int(os.environ['RANK'])
-    ddp_local_rank = int(os.environ['LOCAL_RANK'])
-    ddp_world_size = int(os.environ['WORLD_SIZE'])
-    device = f'cuda:{ddp_local_rank}'
+    ddp_rank = int(os.environ['RANK']) # global rank across all nodes
+    ddp_local_rank = int(os.environ['LOCAL_RANK']) # local rank on the current node
+    ddp_world_size = int(os.environ['WORLD_SIZE']) # 총 GPU 개수
+    device = f'cuda:{ddp_local_rank}' # e.g. 'cuda:0' for the first GPU on this node
     torch.cuda.set_device(device)
     master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
     seed_offset = ddp_rank # each process gets a different seed
@@ -108,18 +108,29 @@ torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
 # note: float16 data type will automatically use a GradScaler
+# ptd : pytorch data type
+# bfloat에서 b는 brain을 의미
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset) # data/openwebtext
+# train_data.shape = (token size, )
+# val_data.shape = (token size, )
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r') # train_data에 data/openwebtext/train.bin을 매핑, dtype은 uint16, mode는 읽기모드
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+# get_batch = train or val data로부터 배치 생성 함수
 def get_batch(split):
     data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,)) # randint(36000 - 2048, 12)
+    # randint(low, high, size) : low부터 high까지 size만큼의 난수를 생성
+    # ix에서 시작해서 block_size만큼 토큰을 가져오기 위함
+    # ix + block_size가 데이터의 길이를 벗어나면 안됨
+    ix = torch.randint(len(data) - block_size, (batch_size,))
+    # x = input, (batch_size, block_size)
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+    # y = target: 입력에서 한칸씩 뒤로 미룬 것
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    # torch.to(device) : device에 있는 메모리로 데이터를 옮김
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
@@ -281,6 +292,7 @@ while True:
                 }
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                # torch.save(model, os.path.join(out_dir, 'model.pt'))
     if iter_num == 0 and eval_only:
         break
 
@@ -304,6 +316,7 @@ while True:
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        # torch.nn.utils.clip_grad_value_(model.parameters(), grad_clip)
     # step the optimizer and scaler if training in fp16
     scaler.step(optimizer)
     scaler.update()
